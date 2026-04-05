@@ -10,10 +10,58 @@ from datetime import datetime, timedelta
 import requests
 import warnings
 import logging
+import threading
+import time
 
 # Suppress yfinance warnings and errors
 warnings.filterwarnings('ignore')
 logging.getLogger('yfinance').setLevel(logging.CRITICAL)
+
+
+class ProgressSpinner:
+    """Shows animated progress spinner while processing"""
+    def __init__(self):
+        self.spinner_chars = ['-', '\\', '|', '/']
+        self.running = False
+        self.thread = None
+        self.idx = 0
+
+    def start(self, message="Processing"):
+        """Start the spinner animation"""
+        self.running = True
+        self.idx = 0
+        self.message = message
+        self.thread = threading.Thread(target=self._spin)
+        self.thread.daemon = True
+        self.thread.start()
+
+    def _spin(self):
+        """Internal method to animate the spinner"""
+        while self.running:
+            sys.stderr.write(f'\r{self.message}... {self.spinner_chars[self.idx]} ')
+            sys.stderr.flush()
+            self.idx = (self.idx + 1) % len(self.spinner_chars)
+            time.sleep(0.1)
+
+    def stop(self):
+        """Stop the spinner animation"""
+        self.running = False
+        if self.thread:
+            self.thread.join()
+        sys.stderr.write('\r' + ' ' * (len(self.message) + 10) + '\r')
+        sys.stderr.flush()
+
+# Manual ISIN to ticker mapping for known mismatches between OpenFIGI and yfinance
+ISIN_TICKER_OVERRIDES = {
+    # German ETFs where OpenFIGI ticker doesn't match yfinance
+    "DE0002635307": {  # iShares STOXX Europe 600 UCITS ETF (DE)
+        "XETRA": "EXSA",
+        "EAM": "EXSA",
+        "TDG": "EXSA",
+    },
+    # Add more manual mappings here as needed
+    # "ISIN": {"EXCHANGE": "TICKER", ...}
+}
 
 
 def isin_to_ticker_candidates(isin, exchange):
@@ -49,6 +97,9 @@ def isin_to_ticker_candidates(isin, exchange):
                     "NASDAQ": ["US", "XNAS"],
                     "LSE": ["LN", "XLON"],
                     "TSE": ["JP", "XTKS"],
+                    "EAM": ["XA", "XAMS"],  # Euronext Amsterdam
+                    "EURONEXT": ["XA", "FP", "XB", "XL"],  # Amsterdam, Paris, Brussels, Lisbon
+                    "TDG": ["GT", "GD", "GF", "GS", "GM"],  # Tradegate (German exchanges)
                 }
 
                 target_codes = exchange_code_groups.get(exchange.upper(), [])
@@ -62,8 +113,8 @@ def isin_to_ticker_candidates(isin, exchange):
                     elif ticker:
                         candidates.append((ticker, result_code))
 
-    except Exception as e:
-        print(f"OpenFIGI lookup failed: {e}", file=sys.stderr)
+    except Exception:
+        pass
 
     return candidates
 
@@ -73,13 +124,29 @@ def get_ticker_symbols(isin, exchange):
     Get list of ticker symbol candidates from ISIN with various exchange suffixes.
     Returns list of ticker symbols to try (limited to avoid excessive attempts).
     """
+    # Check manual override mapping first
+    if isin in ISIN_TICKER_OVERRIDES:
+        override_tickers = ISIN_TICKER_OVERRIDES[isin]
+        if exchange.upper() in override_tickers:
+            manual_ticker = override_tickers[exchange.upper()]
+            # Return the manual ticker with appropriate suffix
+            exchange_suffix_map = {
+                "XETRA": [".DE", ".F"],
+                "LSE": [".L"],
+                "EAM": [".AS"],
+                "EURONEXT": [".PA", ".AS"],
+                "TDG": [".DE", ".F"],
+            }
+            suffixes = exchange_suffix_map.get(exchange.upper(), [""])
+            return [f"{manual_ticker}{suffix}" for suffix in suffixes]
+
     candidates = isin_to_ticker_candidates(isin, exchange)
 
     if not candidates:
         return []
 
-    # Limit to first 3 ticker candidates to avoid excessive lookups
-    candidates = candidates[:3]
+    # Limit to first 5 ticker candidates to avoid excessive lookups
+    candidates = candidates[:5]
 
     # Map exchange to yfinance suffixes to try (limited list)
     exchange_suffix_map = {
@@ -91,7 +158,9 @@ def get_ticker_symbols(isin, exchange):
         "HKEX": [".HK"],
         "TSX": [".TO"],
         "ASX": [".AX"],
-        "EURONEXT": [".PA"],
+        "EAM": [".AS"],  # Euronext Amsterdam
+        "EURONEXT": [".PA", ".AS", ".BR", ".LS"],  # Paris, Amsterdam, Brussels, Lisbon
+        "TDG": [".DE", ".F"],  # Tradegate uses same suffixes as German exchanges
         "BSE": [".BO"],
         "NSE": [".NS"],
     }
@@ -100,6 +169,8 @@ def get_ticker_symbols(isin, exchange):
 
     # Generate all combinations of tickers and suffixes
     ticker_symbols = []
+    base_tickers_tried = set()
+
     for ticker, _ in candidates:
         # If ticker already has a suffix, try it as-is first
         if '.' in ticker:
@@ -108,13 +179,27 @@ def get_ticker_symbols(isin, exchange):
             for suffix in suffixes:
                 ticker_symbols.append(f"{ticker}{suffix}")
 
+                # For tickers ending in '1', also try without the '1'
+                # (OpenFIGI sometimes returns IUSA1 when yfinance needs IUSA)
+                if ticker.endswith('1') or ticker.endswith('EUR') or ticker.endswith('USD') or ticker.endswith('GBP') or ticker.endswith('CHF'):
+                    # Extract base ticker (remove currency suffix or '1')
+                    if ticker.endswith('EUR') or ticker.endswith('USD') or ticker.endswith('GBP') or ticker.endswith('CHF'):
+                        base_ticker = ticker[:-3]
+                    elif ticker.endswith('1'):
+                        base_ticker = ticker[:-1]
+
+                    # Only add if we haven't tried this base ticker yet
+                    if base_ticker not in base_tickers_tried:
+                        ticker_symbols.append(f"{base_ticker}{suffix}")
+                        base_tickers_tried.add(base_ticker)
+
     return ticker_symbols
 
 
-def get_latest_trading_price(ticker_symbols):
+def get_latest_trading_price(ticker_symbols, show_source=False):
     """
     Try to fetch price and name using a list of ticker symbol candidates.
-    Returns (ticker_symbol, price, name) tuple or (None, None, None) if not found.
+    Returns (ticker_symbol, price, name, exchange) tuple or (None, None, None, None) if not found.
     """
     import os
     from contextlib import redirect_stderr
@@ -136,30 +221,32 @@ def get_latest_trading_price(ticker_symbols):
                         # Get the most recent closing price
                         latest_price = hist['Close'].iloc[-1]
 
-                        # Get product name from ticker info
+                        # Get product name and exchange from ticker info
                         try:
                             info = ticker.info
                             name = info.get('longName') or info.get('shortName') or ticker_symbol
+                            exchange_name = info.get('exchange', 'Unknown')
                         except:
                             name = ticker_symbol
+                            exchange_name = 'Unknown'
 
-                        return (ticker_symbol, round(latest_price, 2), name)
+                        # Outside the context manager now
+                        result = (ticker_symbol, round(latest_price, 2), name, exchange_name)
+
+            if 'result' in locals():
+                return result
 
         except Exception:
             # Silently try next ticker
             continue
 
-    return (None, None, None)
+    return (None, None, None, None)
 
 
 def main():
     """
     Main function to read input and process each ISIN/exchange pair.
     """
-    print("Enter ISIN<tab>exchange pairs (one per line). Type 'end' to finish:", file=sys.stderr)
-
-    results = []
-
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -173,19 +260,21 @@ def main():
             # Parse input line (tab-separated)
             parts = line.split('\t')
             if len(parts) != 2:
-                print(f"Invalid input format: {line}", file=sys.stderr)
                 continue
 
             isin = parts[0].strip()
             exchange = parts[1].strip()
 
+            # Check if user wants to see data source (TDG = Tradegate, a special exchange code)
+            show_source = exchange.upper() == "TDG"
+
             # Get ticker symbol candidates and try to fetch price
             ticker_symbols = get_ticker_symbols(isin, exchange)
             if not ticker_symbols:
-                results.append((isin, "Unknown", "N/A"))
+                print(f"Unknown\tN/A\t{isin}")
                 continue
 
-            ticker_used, price, name = get_latest_trading_price(ticker_symbols)
+            ticker_used, price, name, exchange_name = get_latest_trading_price(ticker_symbols, show_source)
 
             if price is None:
                 price_str = "N/A"
@@ -194,15 +283,12 @@ def main():
                 # Format price with comma as decimal separator
                 price_str = f"{price:.2f}".replace('.', ',')
 
-            results.append((isin, name, price_str))
+            # Print result immediately
+            print(f"{name}\t{price_str}\t{isin}")
+            sys.stdout.flush()  # Ensure output is displayed immediately
 
-        except Exception as e:
-            print(f"Error processing line '{line}': {e}", file=sys.stderr)
+        except Exception:
             continue
-
-    # Print all results at the end
-    for isin, name, price in results:
-        print(f"{name}\t{price}\t{isin}")
 
 
 if __name__ == "__main__":
