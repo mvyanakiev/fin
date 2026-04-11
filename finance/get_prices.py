@@ -11,46 +11,10 @@ from datetime import datetime, timedelta
 import requests
 import warnings
 import logging
-import threading
-import time
 
 # Suppress yfinance warnings and errors
 warnings.filterwarnings('ignore')
 logging.getLogger('yfinance').setLevel(logging.CRITICAL)
-
-
-class ProgressSpinner:
-    """Shows animated progress spinner while processing"""
-    def __init__(self):
-        self.spinner_chars = ['-', '\\', '|', '/']
-        self.running = False
-        self.thread = None
-        self.idx = 0
-
-    def start(self, message="Processing"):
-        """Start the spinner animation"""
-        self.running = True
-        self.idx = 0
-        self.message = message
-        self.thread = threading.Thread(target=self._spin)
-        self.thread.daemon = True
-        self.thread.start()
-
-    def _spin(self):
-        """Internal method to animate the spinner"""
-        while self.running:
-            sys.stderr.write(f'\r{self.message}... {self.spinner_chars[self.idx]} ')
-            sys.stderr.flush()
-            self.idx = (self.idx + 1) % len(self.spinner_chars)
-            time.sleep(0.1)
-
-    def stop(self):
-        """Stop the spinner animation"""
-        self.running = False
-        if self.thread:
-            self.thread.join()
-        sys.stderr.write('\r' + ' ' * (len(self.message) + 10) + '\r')
-        sys.stderr.flush()
 
 # Manual ISIN to ticker mapping for known mismatches between OpenFIGI and yfinance
 ISIN_TICKER_OVERRIDES = {
