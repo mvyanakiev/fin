@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
 Program to fetch stock prices for given ISIN and exchange pairs.
-Reads input from terminal (ISIN,exchange format) and outputs ISIN, exchange, and price.
+Reads input from input.txt file (tab-separated ISIN and exchange format) and outputs ISIN, exchange, and price.
 """
 
 import sys
+import os
 import yfinance as yf
 from datetime import datetime, timedelta
 import requests
@@ -245,50 +246,62 @@ def get_latest_trading_price(ticker_symbols, show_source=False):
 
 def main():
     """
-    Main function to read input and process each ISIN/exchange pair.
+    Main function to read input from input.txt and process each ISIN/exchange pair.
     """
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
+    # Get the directory where the script is located
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    input_file = os.path.join(script_dir, 'input.txt')
 
-        # Check for end command
-        if line.lower() == 'end':
-            break
+    # Check if input.txt exists
+    if not os.path.exists(input_file):
+        print(f"Error: input.txt not found in {script_dir}", file=sys.stderr)
+        print(f"Please create an input.txt file with tab-separated ISIN and exchange pairs.", file=sys.stderr)
+        sys.exit(1)
 
-        try:
-            # Parse input line (tab-separated)
-            parts = line.split('\t')
-            if len(parts) != 2:
+    # Read from input.txt file
+    with open(input_file, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
                 continue
 
-            isin = parts[0].strip()
-            exchange = parts[1].strip()
+            # Check for end command
+            if line.lower() == 'end':
+                break
 
-            # Check if user wants to see data source (TDG = Tradegate, a special exchange code)
-            show_source = exchange.upper() == "TDG"
+            try:
+                # Parse input line (tab-separated)
+                parts = line.split('\t')
+                if len(parts) != 2:
+                    continue
 
-            # Get ticker symbol candidates and try to fetch price
-            ticker_symbols = get_ticker_symbols(isin, exchange)
-            if not ticker_symbols:
-                print(f"Unknown\tN/A\t{isin}")
+                isin = parts[0].strip()
+                exchange = parts[1].strip()
+
+                # Check if user wants to see data source (TDG = Tradegate, a special exchange code)
+                show_source = exchange.upper() == "TDG"
+
+                # Get ticker symbol candidates and try to fetch price
+                ticker_symbols = get_ticker_symbols(isin, exchange)
+                if not ticker_symbols:
+                    print(f"Unknown\tN/A\t{isin}")
+                    continue
+
+                ticker_used, price, name, exchange_name = get_latest_trading_price(ticker_symbols, show_source)
+
+                if price is None:
+                    price_str = "N/A"
+                    name = "Unknown"
+                else:
+                    # Format price with comma as decimal separator
+                    price_str = f"{price:.2f}".replace('.', ',')
+
+                # Print result immediately
+                print(f"{name}\t{price_str}\t{isin}")
+                sys.stdout.flush()  # Ensure output is displayed immediately
+
+            except Exception:
                 continue
-
-            ticker_used, price, name, exchange_name = get_latest_trading_price(ticker_symbols, show_source)
-
-            if price is None:
-                price_str = "N/A"
-                name = "Unknown"
-            else:
-                # Format price with comma as decimal separator
-                price_str = f"{price:.2f}".replace('.', ',')
-
-            # Print result immediately
-            print(f"{name}\t{price_str}\t{isin}")
-            sys.stdout.flush()  # Ensure output is displayed immediately
-
-        except Exception:
-            continue
 
 
 if __name__ == "__main__":
